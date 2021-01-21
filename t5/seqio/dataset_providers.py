@@ -989,7 +989,8 @@ class Mixture(DatasetProviderBase):
   def __init__(
       self,
       name: str,
-      tasks: Union[Sequence[str], Sequence[Tuple[str, int]]],
+      tasks: Union[Sequence[str],
+                   Sequence[Tuple[str, Union[float, Callable[[Task], float]]]]],
       default_rate: Union[float, Callable[[Task], float]] = None):
     """Mixture constructor.
 
