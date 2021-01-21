@@ -118,19 +118,24 @@ def get_targets_and_examples(
 class PredictFnCallable(typing_extensions.Protocol):
 
   def __call__(
-      self,
-      dataset: tf.data.Dataset,
-      model_feature_lengths: Mapping[str, int]
-  ) -> Sequence[Tuple[int, Sequence[int]]]: ...
+      self, dataset: tf.data.Dataset, model_feature_lengths: Mapping[str, int]
+  ) -> Sequence[Tuple[int, Sequence[int]]]:
+    ...
 
 
 class ScoreFnCallable(typing_extensions.Protocol):
 
   def __call__(
-      self,
-      dataset: tf.data.Dataset,
-      model_feature_lengths: Mapping[str, int]
-  ) -> Sequence[Tuple[int, float]]: ...
+      self, dataset: tf.data.Dataset,
+      model_feature_lengths: Mapping[str, int]) -> Sequence[Tuple[int, float]]:
+    ...
+
+
+class LogFnCallable(typing_extensions.Protocol):
+
+  def __call__(self, task_metrics: Mapping[str, float], step: int,
+               task_name: str) -> None:
+    ...
 
 
 class Evaluator:
@@ -156,8 +161,7 @@ class Evaluator:
   original task datasets. The latter is passed to `predict_fn` for evaluation.
 
   Attributes:
-    eval_tasks: a mapping from a mixture or a task name to seqio.Task
-      object(s).
+    eval_tasks: a mapping from a mixture or a task name to seqio.Task object(s).
     cached_model_datasets: cached evaluation datasets with model features.
     cached_task_datasets: cached evaluation datasets with task features.
     cached_targets: cached evaluation targets.
@@ -171,7 +175,8 @@ class Evaluator:
                eval_split: str = "validation",
                use_cached: bool = False,
                sequence_length: Mapping[str, int] = None,
-               summary_dir: Optional[str] = None):
+               summary_dir: Optional[str] = None,
+               log_fn: Optional[LogFnCallable] = None):
     """Evaluator constructor.
 
     Args:
@@ -188,7 +193,10 @@ class Evaluator:
         unspecified and the maximum length for each feature will be used. These
         lengths are computed while caching the datasets.
       summary_dir: an optional directory to save the evaluation results in Event
-        protocol buffer format.
+        protocol buffer format. If provided `log_fn` should be None.
+      log_fn: an optional function to use to log evalution results. If a custom
+        logging function is provided `summary_dir` should be None.
+
     Raises:
       ValueError if `sequence_length` is None but a preprocessor depends on its
       value.
@@ -268,7 +276,14 @@ class Evaluator:
     self._model_feature_lengths = feature_converter.get_model_feature_lengths(
         sequence_length)
 
+    if summary_dir is not None and log_fn is not None:
+      raise ValueError(
+          "If using a custom logging function a summary dir should not be "
+          f"provided. Got: `log_fn`={log_fn} `summary_dir`={summary_dir}")
     self._summary_dir = summary_dir
+    self._log_fn = self._log_eval_results
+    if log_fn is not None:
+      self._log_fn = log_fn
     self._summary_writers = {}
 
   def evaluate(self,
@@ -418,14 +433,22 @@ class Evaluator:
               f"Duplicate metric key '{k}' in Task '{task.name}'.")
         all_metrics[task.name][k] = v
 
-      self._log_eval_results(
-          all_metrics[task.name], step, task_name=task.name)
+      self._log_fn(all_metrics[task.name], step, task_name=task.name)
     return all_metrics
 
-  # TODO(hwchung): Support custom logging function metrics.
   def _log_eval_results(self, task_metrics: Mapping[str, float],
                         step: int, task_name: str) -> None:
-    """Log the eval results and optionally write summaries for TensorBoard."""
+    """Log the eval results and optionally write summaries for TensorBoard.
+
+    Note:
+      This is the default implementation using tensorflow v1 operations.
+
+    Args:
+      task_metrics: A mapping from series names to datapoints to be added to
+        that series.
+      step: The timestep to place this datapoint at.
+      task_name: The name of the task these datapoints are relevant to.
+    """
     if step is None:
       logging.warning("Step number for the logging session is not provided. "
                       "A dummy value of -1 will be used.")
