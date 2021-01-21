@@ -20,6 +20,8 @@ import os
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 from absl import logging
+import dataclasses
+import numpy as np
 from t5.seqio import dataset_providers
 from t5.seqio import feature_converters
 import tensorflow.compat.v2 as tf
@@ -37,6 +39,62 @@ MetricsAndOutputsType = Tuple[
     Optional[AllMetricsType],  # metrics
     AllOutputTokensType,  # output_tokens
     AllOutputScoresType]  # output_scores
+
+
+@dataclasses.dataclass
+class Metric:
+  """A base method for the dataclasses that represent tensorboard values.
+
+  Task `metric_fn`s should output `Mapping[str, Metric]` which will be written
+  to tensorboard. `Metric` subclasses are used to dispatch to the correct
+  tensorboard writing function.
+  """
+
+
+@dataclasses.dataclass
+class Scalar(Metric):
+  """The default tensorflow value, used for creating time series graphs."""
+  value: float
+
+
+@dataclasses.dataclass
+class Text(Metric):
+  """Text to output to tensorboard, markdown is rendered by tensorboard."""
+  textdata: str
+
+
+@dataclasses.dataclass
+class Image(Metric):
+  """An image to output to tensorboard."""
+  image: np.ndarray
+
+
+@dataclasses.dataclass
+class Audio(Metric):
+  """An audio example to output to tensorboard."""
+  audiodata: np.ndarray
+  sample_rate: int = 44100
+  max_outputs: int = 3
+
+
+@dataclasses.dataclass
+class Histogram(Metric):
+  """A historgram to output to tensorboard."""
+  values: np.ndarray
+  bins: Optional[int] = None
+
+
+@dataclasses.dataclass
+class HParams(Metric):
+  """Hyperparameters to write to tensorboard."""
+  hparams: Mapping[str, Any]
+
+
+@dataclasses.dataclass
+class Tensor(Metric):
+  """A general tensor that will be written directly to tensorboard."""
+  tensor: tf.Tensor
+  metadata: Optional[Any] = None
 
 
 def get_valid_eval_tasks(tasks: Sequence[Task], split: str) -> Sequence[Task]:
@@ -118,19 +176,24 @@ def get_targets_and_examples(
 class PredictFnCallable(typing_extensions.Protocol):
 
   def __call__(
-      self,
-      dataset: tf.data.Dataset,
-      model_feature_lengths: Mapping[str, int]
-  ) -> Sequence[Tuple[int, Sequence[int]]]: ...
+      self, dataset: tf.data.Dataset, model_feature_lengths: Mapping[str, int]
+  ) -> Sequence[Tuple[int, Sequence[int]]]:
+    ...
 
 
 class ScoreFnCallable(typing_extensions.Protocol):
 
   def __call__(
-      self,
-      dataset: tf.data.Dataset,
-      model_feature_lengths: Mapping[str, int]
-  ) -> Sequence[Tuple[int, float]]: ...
+      self, dataset: tf.data.Dataset,
+      model_feature_lengths: Mapping[str, int]) -> Sequence[Tuple[int, float]]:
+    ...
+
+
+class LogFnCallable(typing_extensions.Protocol):
+
+  def __call__(self, task_metrics: Mapping[str, Metric], step: int,
+               task_name: str) -> None:
+    ...
 
 
 class Evaluator:
@@ -156,8 +219,7 @@ class Evaluator:
   original task datasets. The latter is passed to `predict_fn` for evaluation.
 
   Attributes:
-    eval_tasks: a mapping from a mixture or a task name to seqio.Task
-      object(s).
+    eval_tasks: a mapping from a mixture or a task name to seqio.Task object(s).
     cached_model_datasets: cached evaluation datasets with model features.
     cached_task_datasets: cached evaluation datasets with task features.
     cached_targets: cached evaluation targets.
@@ -171,7 +233,8 @@ class Evaluator:
                eval_split: str = "validation",
                use_cached: bool = False,
                sequence_length: Mapping[str, int] = None,
-               summary_dir: Optional[str] = None):
+               summary_dir: Optional[str] = None,
+               log_fn: Optional[LogFnCallable] = None):
     """Evaluator constructor.
 
     Args:
@@ -188,7 +251,10 @@ class Evaluator:
         unspecified and the maximum length for each feature will be used. These
         lengths are computed while caching the datasets.
       summary_dir: an optional directory to save the evaluation results in Event
-        protocol buffer format.
+        protocol buffer format. If provided `log_fn` should be None.
+      log_fn: an optional function to use to log evalution results. If a custom
+        logging function is provided `summary_dir` should be None.
+
     Raises:
       ValueError if `sequence_length` is None but a preprocessor depends on its
       value.
@@ -268,7 +334,14 @@ class Evaluator:
     self._model_feature_lengths = feature_converter.get_model_feature_lengths(
         sequence_length)
 
+    if summary_dir is not None and log_fn is not None:
+      raise ValueError(
+          "If using a custom logging function a summary dir should not be "
+          f"provided. Got: `log_fn`={log_fn} `summary_dir`={summary_dir}")
     self._summary_dir = summary_dir
+    self._log_fn = self._log_eval_results
+    if log_fn is not None:
+      self._log_fn = log_fn
     self._summary_writers = {}
 
   def evaluate(self,
@@ -418,14 +491,27 @@ class Evaluator:
               f"Duplicate metric key '{k}' in Task '{task.name}'.")
         all_metrics[task.name][k] = v
 
-      self._log_eval_results(
-          all_metrics[task.name], step, task_name=task.name)
+      # Wrap any non-metric value in a Scalar for backward compatability.
+      metrics = {
+          k: Scalar(v) if not isinstance(v, Metric) else v
+          for k, v in all_metrics[task.name].items()
+      }
+      self._log_fn(metrics, step, task_name=task.name)
     return all_metrics
 
-  # TODO(hwchung): Support custom logging function metrics.
-  def _log_eval_results(self, task_metrics: Mapping[str, float],
-                        step: int, task_name: str) -> None:
-    """Log the eval results and optionally write summaries for TensorBoard."""
+  def _log_eval_results(self, task_metrics: Mapping[str, Scalar], step: int,
+                        task_name: str) -> None:
+    """Log the eval results and optionally write summaries for TensorBoard.
+
+    Note:
+      This is the default implementation using tensorflow v1 operations.
+
+    Args:
+      task_metrics: A mapping from series names to datapoints to be added to
+        that series.
+      step: The timestep to place this datapoint at.
+      task_name: The name of the task these datapoints are relevant to.
+    """
     if step is None:
       logging.warning("Step number for the logging session is not provided. "
                       "A dummy value of -1 will be used.")
@@ -438,10 +524,10 @@ class Evaluator:
         summary = tf.compat.v1.Summary()
 
       tag = f"eval/{metric_name}"
-      logging.info("%s at step %d: %.3f", tag, step, metric_value)
+      logging.info("%s at step %d: %.3f", tag, step, metric_value.value)
 
       if summary_writer:
-        summary.value.add(tag=tag, simple_value=metric_value)
+        summary.value.add(tag=tag, simple_value=metric_value.value)
         summary_writer.add_summary(summary, step)
 
     if summary_writer:
